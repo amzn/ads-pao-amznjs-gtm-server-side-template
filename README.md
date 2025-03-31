@@ -1,11 +1,7 @@
-## My Project
+## Amazon Advertising Tag - Server Side GTM Template
 
-TODO: Fill this README out!
+This repository hosts the Server Side Google Tag Manager template for Amazon Ad Tag.
 
-Be sure to:
-
-* Change the title in this README
-* Edit your repository description on GitHub
 
 ## Security
 
@@ -14,4 +10,3 @@ See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more inform
 ## License
 
 This project is licensed under the Apache-2.0 License.
-

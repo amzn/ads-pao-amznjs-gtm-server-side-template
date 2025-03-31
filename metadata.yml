@@ -1,0 +1,5 @@
+homepage: "https://advertising.amazon.com"
+documentation: "https://advertising.amazon.com/dsp/help#/"
+versions:
+  - sha: 7c181428dd034817d5bd2ae0c2f88028fdf6bd26
+    changeNotes: Initial release.
