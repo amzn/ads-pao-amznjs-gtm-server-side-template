@@ -1,10 +1,3 @@
-___TERMS_OF_SERVICE___
-
-By creating or modifying this file you agree to Google Tag Manager's Community
-Template Gallery Developer Terms of Service available at
-https://developers.google.com/tag-manager/gallery-tos (or such other URL as
-Google may provide), as modified from time to time.
-
 ___INFO___
 
 {
@@ -23,7 +16,7 @@ ___INFO___
     "ATTRIBUTION",
     "CONVERSIONS"
   ],
-  "description": "Amazon Advertising Tag Server-Side template - version 1.3",
+  "description": "The server-side tag template to send event from your tagging server to Amazon Ad Tag. Version 1.4",
   "containerContexts": [
     "SERVER"
   ]
@@ -621,7 +614,7 @@ ___TEMPLATE_PARAMETERS___
 
 ___SANDBOXED_JS_FOR_SERVER___
 
-const version = "1.2";
+const version = "1.4";
 
 const encodeUriComponent = require('encodeUriComponent');
 const getEventData = require('getEventData');
@@ -670,6 +663,84 @@ const constants = {
   MEASUREMENT_TIMESTAMP_SEPARATOR: '.',
   NUM_MAX_MEASUREMENT_TOKENS: 147,
   MEASUREMENT_TOKEN_TTL_IN_MS: 2592000000, // 30 days in milliseconds,
+  REPORTING_ATTRIBUTES: [
+        'brand',
+        'category',
+        'productid',
+        'attr1',
+        'attr2',
+        'attr3',
+        'attr4',
+        'attr5',
+        'attr6',
+        'attr7',
+        'attr8',
+        'attr9',
+        'attr10',
+    ],
+    REPORTING_ATTRIBUTE_MAX_LENGTH: 256,
+    REPORTING_ATTRIBUTE_MAX_LENGTH_WARNING: 'Length of attribute must be between 1 and 256 characters.',
+    REPORTING_ATTRIBUTE_PROHIBITED_CHARACTERS_WARNING: 'Attribute may only contain letters, numbers, and the underscore character.',
+    REPORTING_ATTRIBUTE_VALUE_NOT_STRING_WARNING: 'Attribute must be a string and cannot be an object or array.',
+};
+
+function replaceNonAlphanumeric(inputString) {
+  if (!inputString) return '';
+  
+  let result = '';
+  let lastWasUnderscore = false;
+  
+  for (let i = 0; i < inputString.length; i++) {
+    const char = inputString.charAt(i);
+    
+    // Check if character is alphanumeric using comparison operators
+    const isAlphanumeric = 
+      (char >= '0' && char <= '9') ||  // 0-9
+      (char >= 'A' && char <= 'Z') ||  // A-Z
+      (char >= 'a' && char <= 'z');    // a-z
+    
+    if (isAlphanumeric) {
+      result += char;
+      lastWasUnderscore = false;
+    } else if (!lastWasUnderscore) {
+      result += '_';
+      lastWasUnderscore = true;
+    }
+    // Skip consecutive non-alphanumeric characters
+  }
+  
+  return result;
+}
+
+const validateCustomAttributesForReporting = (attribute, internalEventAttributes) => {
+    let reportingAttributeWarnings;
+    const attributeValue = internalEventAttributes[attribute];
+    let newAttributeValue = attributeValue;
+    const attributeName = attribute.toLowerCase();
+    if (constants.REPORTING_ATTRIBUTES.indexOf(attributeName) != -1) {
+        reportingAttributeWarnings = {};
+        reportingAttributeWarnings[attributeName] = { messages: [] };
+        if (attributeValue.length > constants.REPORTING_ATTRIBUTE_MAX_LENGTH || attributeValue.length < 1) {
+            reportingAttributeWarnings[attributeName].messages.push(constants.REPORTING_ATTRIBUTE_MAX_LENGTH_WARNING);
+        }
+        if (typeof attributeValue === 'string') {
+            newAttributeValue = replaceNonAlphanumeric(newAttributeValue.trim());
+        } else {
+            reportingAttributeWarnings[attributeName].messages.push(constants.REPORTING_ATTRIBUTE_VALUE_NOT_STRING_WARNING);
+        }
+
+        if (reportingAttributeWarnings[attributeName].messages.length === 0) {
+            reportingAttributeWarnings = undefined;
+        } else {
+            reportingAttributeWarnings[attributeName].value = newAttributeValue;
+            newAttributeValue = undefined;
+        }
+    }
+
+    return {
+        eventReportingAttributeWarnings: reportingAttributeWarnings,
+        newAttributeValue: newAttributeValue
+    };
 };
 
 const pixelUrls = {
@@ -812,9 +883,9 @@ function saveMeasurementTokenInURLToCookieIfPresent(data) {
   if (region.toUpperCase() !== 'NA') {
     return;
   }
-
+  
   if (!url || !url.searchParams) {
-    return;
+    return; 
   }
 
   const currURLMeasurementToken = url.searchParams.get(constants.MT_LP_QUERY_PARAM);
@@ -1021,9 +1092,7 @@ if (data.advancedMatchingList) {
   log("token config =", tokenConfig);
 }
 
-if (tokenConfig.hashedRecords.length == 0) {
-  return fail('User data was not specified');
-}
+const hasHashedRecords = tokenConfig.hashedRecords.length != 0;
 
 function formatRequestBody(tokenConfig) {
   const body = {};
@@ -1094,7 +1163,14 @@ function trackEvent(pixelUrl, token, testTagId, event, params, consent) {
         if (typeof value === 'object') {
           value = encodeUriComponent(JSON.stringify(value));
         }
-        url += '&'+param+'='+value;
+        const customAttributesData = validateCustomAttributesForReporting(param, params);
+        log(customAttributesData);
+        if (customAttributesData.newAttributeValue !== undefined){
+          url += '&'+param+'='+customAttributesData.newAttributeValue;
+        } else {
+          log(customAttributesData.eventReportingAttributeWarnings);
+        }
+        
       } else {
         log('Key '+param + 'has no value');
       }
@@ -1119,8 +1195,9 @@ function trackEvent(pixelUrl, token, testTagId, event, params, consent) {
   }
 
   if (MEASUREMENT_TOKEN_VALUE.length > 0) {
-    url += '&'+constants.MTS_EVENT_ATTRIBUTES+'='+MEASUREMENT_TOKEN_VALUE;
+    url += '&'+constants.MTS_EVENT_ATTRIBUTE+'='+MEASUREMENT_TOKEN_VALUE;
   }
+  log(url);
 
   sendHttpGet(url).then((eventRes) => {
     log(eventRes);
@@ -1137,7 +1214,7 @@ function trackEvent(pixelUrl, token, testTagId, event, params, consent) {
 // Check for existing token in 1p cookie
 let existingToken = getCookieValues('aatToken')[0]; // Assuming 'aatToken' is the name of your 1p cookie
 
-if (!existingToken) {
+if (!existingToken && hasHashedRecords) {
     // No existing token found, proceed with token generation and storage
     sendHttpRequest('https://tk.amazon-adsystem.com/envelope', {
         method: 'POST',
@@ -1372,52 +1449,6 @@ scenarios:
 - name: Library is injected
   code: |
     runCode(mockData);
-- name: GTM success/ failure depending on the user data
-  code: |
-    // Define the mock data object with gtmOnSuccess and gtmOnFailure methods
-    var mockDataSuccessCase = {
-      advancedMatchingList: [{ key: "value" }], // Example data to simulate success
-      gtmOnFailure: function() {
-        failureCalled = true;
-      },
-      gtmOnSuccess: function() {
-        successCalled = true;
-      }
-    };
-
-    var mockDataFailureCase = {
-      advancedMatchingList: [], // Example data to simulate failure
-      gtmOnFailure: function() {
-        failureCalled = true;
-      },
-      gtmOnSuccess: function() {
-        successCalled = true;
-      }
-    };
-    function runCode(data) {
-      if (!data || !data.advancedMatchingList || data.advancedMatchingList.length === 0) {
-        if (typeof data.gtmOnFailure === 'function') {
-          data.gtmOnFailure();
-        }
-        return 'Error: No user data provided';
-      } else {
-        if (typeof data.gtmOnSuccess === 'function') {
-          data.gtmOnSuccess();
-        }
-        return 'Success';
-      }
-    }
-    // Testing success scenario
-    successCalled = false;
-    failureCalled = false;
-    runCode(mockDataSuccessCase);
-    assertThat(successCalled, "Expected gtmOnSuccess to be called when user data is provided.");
-
-    // Testing failure scenario
-    successCalled = false;
-    failureCalled = false;
-    runCode(mockDataFailureCase);
-    assertThat(failureCalled, "Expected gtmOnFailure to be called when no user data is provided.");
 - name: GTM Generates the AIP Token when user data is present
   code: "// Mock user data\nconst mockUserData = {\n    email: \"user@example.com\"\
     ,\n    phone: \"1234567890\"\n};\n\n    const gtmOnSuccess = function() {\n  \
@@ -1542,6 +1573,16 @@ scenarios:
     \ was called.\";\n    return \"Test Inconclusive: No callback was called.\";\n\
     }\n\nlet testResult = getTokenAndVerify(gtmOnSuccess, gtmOnFailure);\n\nassertThat(testResult,\
     \ \"Test Passed: Success callback was called.\");\n"
+- name: GTM handles no hashed records
+  code: "const localMockData = {\n  tagIds: [{TagIds: tag1}],\n  standardEventName:\
+    \ eventName,\n  tagRegion: region,\n  page_location: 'https://example.com?aref=testAref',\n\
+    \  advancedMatchingList: [\n    \n  ],\n  ttl: 3600,\n  defaultAttributes: [{\n\
+    \    Attribute: 'brand',\n    value: 'test brand'\n  }, {Attribute: 'Category',\
+    \ value: ' test - category '}],\n  amazonConsent: {enabled: true},\n  gtmOnSuccess:\
+    \ function() { successCalled = true; },\n  gtmOnFailure: function() { failureCalled\
+    \ = true; }\n};\n\nmock('getCookieValues', function(name) {\n  return [];\n});\n\
+    \n// Call runCode to run the template's code.\nrunCode(localMockData);\n\n// Verify\
+    \ that the tag finished successfully.\nassertApi('gtmOnSuccess').wasCalled();"
 setup: |-
   const log = require('logToConsole');
 
