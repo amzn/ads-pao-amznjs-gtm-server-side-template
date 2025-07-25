@@ -1,10 +1,3 @@
-___TERMS_OF_SERVICE___
-
-By creating or modifying this file you agree to Google Tag Manager's Community
-Template Gallery Developer Terms of Service available at
-https://developers.google.com/tag-manager/gallery-tos (or such other URL as
-Google may provide), as modified from time to time.
-
 ___INFO___
 
 {
@@ -23,7 +16,7 @@ ___INFO___
     "ATTRIBUTION",
     "CONVERSIONS"
   ],
-  "description": "The server-side tag template to send event from your tagging server to Amazon Ad Tag. Version 1.4",
+  "description": "The server-side tag template to send event from your tagging server to Amazon Ad Tag. Version 1.5",
   "containerContexts": [
     "SERVER"
   ]
@@ -621,7 +614,7 @@ ___TEMPLATE_PARAMETERS___
 
 ___SANDBOXED_JS_FOR_SERVER___
 
-const version = "1.4";
+const version = "1.5";
 
 const encodeUriComponent = require('encodeUriComponent');
 const getEventData = require('getEventData');
@@ -693,19 +686,19 @@ const constants = {
 
 function replaceNonAlphanumeric(inputString) {
   if (!inputString) return '';
-  
+
   let result = '';
   let lastWasUnderscore = false;
-  
+
   for (let i = 0; i < inputString.length; i++) {
     const char = inputString.charAt(i);
-    
+
     // Check if character is alphanumeric using comparison operators
-    const isAlphanumeric = 
+    const isAlphanumeric =
       (char >= '0' && char <= '9') ||  // 0-9
       (char >= 'A' && char <= 'Z') ||  // A-Z
       (char >= 'a' && char <= 'z');    // a-z
-    
+
     if (isAlphanumeric) {
       result += char;
       lastWasUnderscore = false;
@@ -715,7 +708,7 @@ function replaceNonAlphanumeric(inputString) {
     }
     // Skip consecutive non-alphanumeric characters
   }
-  
+
   return result;
 }
 
@@ -890,9 +883,9 @@ function saveMeasurementTokenInURLToCookieIfPresent(data) {
   if (region.toUpperCase() !== 'NA') {
     return;
   }
-  
+
   if (!url || !url.searchParams) {
-    return; 
+    return;
   }
 
   const currURLMeasurementToken = url.searchParams.get(constants.MT_LP_QUERY_PARAM);
@@ -992,14 +985,12 @@ for (const key in finalAttributes) {
 const gdprAttributes = {};
 let ttl = null;
 
-//added includes instead of indexOf more modern and concise way to check if the element exists
-
 if (data.includeTcf) {
   const possibleGDPRvalues = [0, 1, 2];
-  if (possibleGDPRvalues.includes(data.gdpr)) gdprAttributes.gdpr = data.gdpr;
+  if (possibleGDPRvalues.indexOf(data.gdpr) !== -1) gdprAttributes.gdpr = data.gdpr;
 
   const possibleGDPRPDvalues = [-1, 0, 1];
-  if (possibleGDPRPDvalues.includes(data.gdprPd)) gdprAttributes.gdprPd = data.gdprPd;
+  if (possibleGDPRPDvalues.indexOf(data.gdprPd) !== -1) gdprAttributes.gdprPd = data.gdprPd;
 
   if (data.gdprConsent) gdprAttributes.gdprConsent = data.gdprConsent;
 }
@@ -1177,7 +1168,7 @@ function trackEvent(pixelUrl, token, testTagId, event, params, consent) {
         } else {
           log(customAttributesData.eventReportingAttributeWarnings);
         }
-        
+
       } else {
         log('Key '+param + 'has no value');
       }
