@@ -1,6 +1,8 @@
 homepage: "https://advertising.amazon.com"
 documentation: "https://advertising.amazon.com/help/G22L5ERYZS47PZJ7"
 versions:
+  - sha: 793ebf27734c671074536f6be3542b187b647d35
+    changeNotes: Replace includes() with indexOf() for better compatibility
   - sha: 1f25f19b732636692fd6bcbe2b91f4ad5cc3903e
     changeNotes: Relaxes validations for custom attributes and user data. Fixes measurement token bug.
   - sha: bdba8d937fb8908fb8f25d55c012d5ea662ad150
