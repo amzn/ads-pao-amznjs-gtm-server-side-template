@@ -1232,7 +1232,7 @@ if (!existingToken && hasHashedRecords) {
         if (body[AIPES_RESPONSE_TOKEN_FIELD_NAME] && body[AIPES_RESPONSE_TOKEN_FIELD_NAME] !== constants.NO_CONSENT_COOKIE_NAME) {
             const token = body[AIPES_RESPONSE_TOKEN_FIELD_NAME];
             // Store the new token in a 1p cookie
-            setCookie('aatToken', token, {'max-age': 3600 * 24 * 365 * 2, path: '/', httpOnly: true, secure: true,
+            setCookie('aatToken', token, {'max-age': 3600 * 24 * 7, path: '/', httpOnly: true, secure: true,
   });
             existingToken = token; // Update the existingToken variable with the new token
           tagIds.forEach((tag) => trackEvent(pixelUrls[region], existingToken, tag, eventName, finalAttributes, gdprAttributes));
@@ -1544,7 +1544,7 @@ scenarios:
     \ Mock getCookieValues function\nfunction getCookieValues(cookieName) {\n    return\
     \ cookies[cookieName] ? [cookies[cookieName]] : [];\n}\n\nfunction testTokenStorage()\
     \ {\n    const expectedToken = \"mockToken123\"; \n\n    setCookie('aatToken',\
-    \ expectedToken, {'max-age': 3600 * 24 * 365 * 2, path: '/', httpOnly: true, secure:\
+    \ expectedToken, {'max-age': 3600 * 24 * 7, path: '/', httpOnly: true, secure:\
     \ true});\n\n    const storedToken = getCookieValues('aatToken')[0];\n\n    assertThat(storedToken\
     \ === expectedToken, \"The token stored in the aatToken cookie does not match\
     \ the expected value.\");\n}\n\ntestTokenStorage();\n"
