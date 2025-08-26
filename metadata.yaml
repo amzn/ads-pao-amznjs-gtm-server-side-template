@@ -1,6 +1,8 @@
 homepage: "https://advertising.amazon.com"
 documentation: "https://advertising.amazon.com/help/G22L5ERYZS47PZJ7"
 versions:
+  - sha: fbcdfc998f370ee45e92da77281c199b2ddec6e4
+    changeNotes: Update aatToken cookie expiration from 2 years to 7 days
   - sha: abe72db59088d27caeea23d450426874ccea6f4e
     changeNotes: Add Terms of Service
   - sha: 793ebf27734c671074536f6be3542b187b647d35
