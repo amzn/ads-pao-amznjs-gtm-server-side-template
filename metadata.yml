@@ -1,0 +1,6 @@
+gtm_template:
+  repository: "amzn/ads-pao-amznjs-gtm-server-side-template"
+  sha: "fbcdfc998f370ee45e92da77281c199b2ddec6e4"
+  branch: "update-aattoken-expiration"
+  description: "Updated aatToken cookie expiration from 2 years to 7 days"
+  pr_url: "https://github.com/amzn/ads-pao-amznjs-gtm-server-side-template/pull/8"
