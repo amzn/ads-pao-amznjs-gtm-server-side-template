@@ -1,6 +1,8 @@
 homepage: "https://advertising.amazon.com"
 documentation: "https://advertising.amazon.com/help/G22L5ERYZS47PZJ7"
 versions:
+  - sha: efe3f42f54e88e8aa5de310d5ecd3a1629fa3822
+    changeNotes: Forward the shopper IP and user agent as client_ip and client_ua, capture the measurement token from the landing URL and send it as arefs with arefsSource, send the Amazon consent string on the event call, and correct the TCF query parameter names.
   - sha: fbcdfc998f370ee45e92da77281c199b2ddec6e4
     changeNotes: Update aatToken cookie expiration from 2 years to 7 days
   - sha: abe72db59088d27caeea23d450426874ccea6f4e
