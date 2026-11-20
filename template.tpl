@@ -29,7 +29,6 @@ ___INFO___
   ]
 }
 
-
 ___TEMPLATE_PARAMETERS___
 
 [
@@ -618,10 +617,9 @@ ___TEMPLATE_PARAMETERS___
   }
 ]
 
-
 ___SANDBOXED_JS_FOR_SERVER___
 
-const version = "1.5";
+const version = "1.6";
 
 const encodeUriComponent = require('encodeUriComponent');
 const getEventData = require('getEventData');
@@ -639,9 +637,7 @@ const setCookie = require('setCookie');
 const parseUrl = require('parseUrl');
 const getTimestampMillis = require('getTimestampMillis');
 
-
 const AIPES_RESPONSE_TOKEN_FIELD_NAME = 'AIPToken';
-
 
 const constants = {
   nameLength: 256,
@@ -665,11 +661,15 @@ const constants = {
   AIPES_AMAZON_CONSENT_IP_ADDRESS_FIELD_NAME: 'ipAddress',
   MT_LP_QUERY_PARAM: 'aref',
   MTS_EVENT_ATTRIBUTE: 'arefs',
+  MTS_SOURCE_EVENT_ATTRIBUTE: 'arefsSource',
   MEASUREMENT_TOKEN_COOKIE_NAME: 'amznAref',
   MEASUREMENT_TOKEN_TIMESTAMP_PAIR_DELIMITER: '|',
   MEASUREMENT_TIMESTAMP_SEPARATOR: '.',
   NUM_MAX_MEASUREMENT_TOKENS: 147,
   MEASUREMENT_TOKEN_TTL_IN_MS: 2592000000, // 30 days in milliseconds,
+  CLIENT_IP_EVENT_ATTRIBUTE: 'client_ip',
+  CLIENT_UA_EVENT_ATTRIBUTE: 'client_ua',
+  CLIENT_UA_MAX_LENGTH: 512,
   REPORTING_ATTRIBUTES: [
         'brand',
         'category',
@@ -808,11 +808,21 @@ const globalAmazonConsent = {
   }
 };
 
+// Set by formatAmazonConsent when it substitutes the default, so the event call can tell a
+// substituted pair from one the advertiser configured. Single source of truth: the guard
+// below decides, nothing re-derives it.
+let amazonConsentDefaultApplied = false;
+
 const formatAmazonConsent = (amazonConsent) => {
   const consentString = {};
 
   const consentObject = {};
   if (globalAmazonConsent.amazonConsentFormat.amznAdStorage === undefined && globalAmazonConsent.amazonConsentFormat.amznUserData === undefined && globalAmazonConsent.gpp === undefined) {
+    // No ACS or GPP configured by the advertiser, so substitute a positive pair for the
+    // token request. A temporary measure that keeps advertisers unblocked while they adopt a
+    // real consent signal: the guard below withholds it from the event call, and it never
+    // overwrites anything the advertiser configured.
+    amazonConsentDefaultApplied = true;
     globalAmazonConsent.amazonConsentFormat = {
       amznAdStorage: "GRANTED",
       amznUserData: "GRANTED",
@@ -841,6 +851,39 @@ const formatAmazonConsent = (amazonConsent) => {
   return consentString;
 };
 
+function hasKeys(value) {
+  if (!value) {
+    return false;
+  }
+
+  const keys = Object.keys(value);
+  return keys !== undefined && keys.length > 0;
+}
+
+// True when the consent string carries anything worth sending: an ACS pair, a GPP string
+// or a geo block. Geo counts on its own because it is what selects the country the consent
+// rules are evaluated against; only a wholly empty object is dropped. This matches the
+// client-side tag, which sends whatever the advertiser configured.
+function hasAmazonConsentSignal(consentString) {
+  return hasKeys(consentString[constants.AIPES_AMAZON_CONSENT_CONSENT_FIELD_NAME])
+    || hasKeys(consentString[constants.AIPES_AMAZON_CONSENT_GEO_FIELD_NAME]);
+}
+
+// Built once for every event, not only on the advanced matching path, so the same value
+// can go on both the token request body and the event call. Called exactly once:
+// formatAmazonConsent mutates globalAmazonConsent when it applies the region default.
+const globalAmazonConsentString = formatAmazonConsent(globalAmazonConsent);
+const hasConsentSignal = hasAmazonConsentSignal(globalAmazonConsentString);
+
+// A substituted region default is for the token request only. The event call sends nothing
+// when the advertiser configured no consent, matching the client-side tag. The event
+// endpoint reads only the consent half of this string, so a geo-only payload would convey
+// nothing there either.
+// Serialized form for the event call, read by trackEvent. Empty means do not send it.
+let AMAZON_CONSENT_STRING = '';
+if (hasConsentSignal && !amazonConsentDefaultApplied) {
+  AMAZON_CONSENT_STRING = JSON.stringify(globalAmazonConsentString);
+}
 
 // Field processing
 const tagIds = data.tagIds
@@ -871,6 +914,13 @@ function measurementTokenTimestampPairsNestedArrToMeasurementTokenCookie(measure
 }
 
 let MEASUREMENT_TOKEN_VALUE = '';
+// How the tokens in MEASUREMENT_TOKEN_VALUE were collected, set by whichever function
+// collected them so the label cannot drift from the value. Only the landing-URL path is
+// live today, so the only value it takes is 'url'; the cookie path, when it is enabled,
+// sets 'cookie' or 'urlAndCookie' instead. Never sent without a token: the event call
+// appends both together. Downstream resolves cookie-sourced tokens only when GDPR does
+// not apply, so a wrong label here would resolve tokens that must not be.
+let MEASUREMENT_TOKEN_SOURCE = '';
 
 function measurementTokenCookieToMeasurementTokenTimestampPairsNestedArr(measurementTokenCookieValue) {
   if (!measurementTokenCookieValue) return [];
@@ -895,7 +945,11 @@ function saveMeasurementTokenInURLToCookieIfPresent(data) {
     return;
   }
 
-  const currURLMeasurementToken = url.searchParams.get(constants.MT_LP_QUERY_PARAM);
+  let currURLMeasurementToken = url.searchParams[constants.MT_LP_QUERY_PARAM];
+
+  if (currURLMeasurementToken && currURLMeasurementToken.push) {
+    currURLMeasurementToken = currURLMeasurementToken[0];
+  }
 
   if (!currURLMeasurementToken) {
     return;
@@ -969,8 +1023,84 @@ function removeAnyExpiredMeasurementTokens() {
   });
 }
 
-removeAnyExpiredMeasurementTokens();
-saveMeasurementTokenInURLToCookieIfPresent(data);
+// Captures the measurement token from the landing URL of this event and nothing more. The
+// two functions above (saveMeasurementTokenInURLToCookieIfPresent and
+// removeAnyExpiredMeasurementTokens) are kept for the deferred cookie-persistence work and
+// are deliberately not called: writing amznAref needs a set_cookies permission the template
+// does not have today.
+function captureMeasurementTokenFromLandingUrl() {
+  const url = parseUrl(getEventData('page_location') || '');
+
+  if (!url || !url.searchParams) {
+    return;
+  }
+
+  // searchParams is a plain object, not a URLSearchParams: no .get. A repeated key
+  // arrives as an Array, told apart by .push so no API call is spent per event.
+  let token = url.searchParams[constants.MT_LP_QUERY_PARAM];
+
+  if (token && token.push) {
+    token = token[0];
+  }
+
+  if (!token) {
+    return;
+  }
+
+  // Same wire format the serialiser has always produced: <token>.<timestamp>. The token is
+  // encoded because it comes from the landing URL, which anyone can craft: the parsed
+  // value is already decoded, so a token such as "x&gdpr=0" would otherwise inject extra
+  // parameters into the event call. The separators stay unencoded, as structure.
+  MEASUREMENT_TOKEN_VALUE = measurementTokenTimestampPairsNestedArrToMeasurementTokenCookie(
+    [[encodeUriComponent(token), getTimestampMillis()]]
+  );
+  MEASUREMENT_TOKEN_SOURCE = 'url';
+}
+
+captureMeasurementTokenFromLandingUrl();
+
+// client_ip is accepted only as a bare IP literal: no surrounding brackets and no
+// zone/scope suffix, so [2001:db8::1] and fe80::1%eth0 are both rejected on arrival.
+// Strip both forms so an IPv6 value from the event data is accepted. A comma-separated
+// list is deliberately not handled: ip_override carries a single address.
+function formatClientIp(ip) {
+  let formatted = makeString(ip);
+
+  if (formatted.indexOf('[') === 0) {
+    formatted = formatted.substring(1);
+  }
+  if (formatted.indexOf(']') !== -1) {
+    formatted = formatted.split(']')[0];
+  }
+  if (formatted.indexOf('%') !== -1) {
+    formatted = formatted.split('%')[0];
+  }
+
+  return formatted;
+}
+
+// This request leaves the advertiser's tagging server, not the shopper's browser, so
+// without these Amazon sees the server's address and user agent: the IP-based identity
+// models cannot run and the derived country is wrong, which matters because country
+// selects the consent evaluation path. Read once per event rather than inside trackEvent,
+// which runs once for every configured tag id.
+let CLIENT_IP_VALUE = '';
+let CLIENT_UA_VALUE = '';
+
+function captureShopperIpAndUserAgent() {
+  const shopperIp = getEventData('ip_override');
+  if (shopperIp) {
+    CLIENT_IP_VALUE = formatClientIp(shopperIp);
+  }
+
+  const shopperUa = getEventData('user_agent');
+  if (shopperUa) {
+    // The 512-character limit applies to the decoded value, so clamp before encoding.
+    CLIENT_UA_VALUE = makeString(shopperUa).substring(0, constants.CLIENT_UA_MAX_LENGTH);
+  }
+}
+
+captureShopperIpAndUserAgent();
 
 let attributes = {};
 if (eventName === "Off-AmazonPurchases") {
@@ -989,17 +1119,28 @@ for (const key in finalAttributes) {
   }
 }
 
-const gdprAttributes = {};
+// The token body uses camelCase keys; the event call uses the snake_case key as the
+// query parameter name. Build the two separately rather than sharing one object.
+const gdprAatTokenAttributes = {};
+const gdprEventAttributes = {};
 let ttl = null;
 
 if (data.includeTcf) {
   const possibleGDPRvalues = [0, 1, 2];
-  if (possibleGDPRvalues.indexOf(data.gdpr) !== -1) gdprAttributes.gdpr = data.gdpr;
+  if (possibleGDPRvalues.indexOf(data.gdpr) !== -1) {
+    gdprAatTokenAttributes.gdpr = data.gdpr;
+    gdprEventAttributes.gdpr = data.gdpr;
+  }
 
   const possibleGDPRPDvalues = [-1, 0, 1];
-  if (possibleGDPRPDvalues.indexOf(data.gdprPd) !== -1) gdprAttributes.gdprPd = data.gdprPd;
+  if (possibleGDPRPDvalues.indexOf(data.gdprPd) !== -1) {
+    gdprEventAttributes.gdpr_pd = data.gdprPd;
+  }
 
-  if (data.gdprConsent) gdprAttributes.gdprConsent = data.gdprConsent;
+  if (data.gdprConsent) {
+    gdprAatTokenAttributes.gdprConsent = data.gdprConsent;
+    gdprEventAttributes.gdpr_consent = data.gdprConsent;
+  }
 }
 
 const tokenConfig = {
@@ -1044,12 +1185,12 @@ if (data.advancedMatchingList) {
         }
     });
 
-    if (gdprAttributes.gdpr) {
-        tokenConfig.gdpr.enabled = !!gdprAttributes.gdpr;
+    if (gdprAatTokenAttributes.gdpr) {
+        tokenConfig.gdpr.enabled = !!gdprAatTokenAttributes.gdpr;
     }
 
-    if (gdprAttributes.gdprConsent) {
-        tokenConfig.gdpr.consent = gdprAttributes.gdprConsent;
+    if (gdprAatTokenAttributes.gdprConsent) {
+        tokenConfig.gdpr.consent = gdprAatTokenAttributes.gdprConsent;
     }
 
     if (tokenConfig.gdpr.enabled && !tokenConfig.gdpr.consent) {
@@ -1060,8 +1201,10 @@ if (data.advancedMatchingList) {
         tokenConfig.ttl = ttl;
     }
 
-    if (globalAmazonConsent) {
-      tokenConfig.consentString = formatAmazonConsent(globalAmazonConsent);
+    // Send it only when it carries something. With neither geo nor a consent signal the
+    // string conveys nothing, so omit it rather than send an empty shell.
+    if (hasConsentSignal) {
+      tokenConfig.consentString = globalAmazonConsentString;
     }
 
     log("token config =", tokenConfig);
@@ -1201,7 +1344,26 @@ function trackEvent(pixelUrl, token, testTagId, event, params, consent) {
 
   if (MEASUREMENT_TOKEN_VALUE.length > 0) {
     url += '&'+constants.MTS_EVENT_ATTRIBUTE+'='+MEASUREMENT_TOKEN_VALUE;
+    url += '&'+constants.MTS_SOURCE_EVENT_ATTRIBUTE+'='+MEASUREMENT_TOKEN_SOURCE;
   }
+
+  // Appended after the validation gate above: an encoded consent string carrying geo,
+  // the ACS pair and a GPP string can exceed constants.valueLength, which aborts the
+  // whole event rather than the offending parameter.
+  if (AMAZON_CONSENT_STRING.length > 0) {
+    url += '&'+constants.AIPES_AMAZON_CONSENT_STRING_FIELD_NAME+'='+encodeUriComponent(AMAZON_CONSENT_STRING);
+  }
+
+  // Appended after the gate for the same reason: a percent-encoded user agent can exceed
+  // constants.valueLength, and the gate aborts the whole event rather than the offending
+  // parameter. The 512-character limit is therefore enforced at capture, not by the gate.
+  if (CLIENT_IP_VALUE.length > 0) {
+    url += '&'+constants.CLIENT_IP_EVENT_ATTRIBUTE+'='+encodeUriComponent(CLIENT_IP_VALUE);
+  }
+  if (CLIENT_UA_VALUE.length > 0) {
+    url += '&'+constants.CLIENT_UA_EVENT_ATTRIBUTE+'='+encodeUriComponent(CLIENT_UA_VALUE);
+  }
+
   log(url);
 
   sendHttpGet(url).then((eventRes) => {
@@ -1235,7 +1397,7 @@ if (!existingToken && hasHashedRecords) {
             setCookie('aatToken', token, {'max-age': 3600 * 24 * 7, path: '/', httpOnly: true, secure: true,
   });
             existingToken = token; // Update the existingToken variable with the new token
-          tagIds.forEach((tag) => trackEvent(pixelUrls[region], existingToken, tag, eventName, finalAttributes, gdprAttributes));
+          tagIds.forEach((tag) => trackEvent(pixelUrls[region], existingToken, tag, eventName, finalAttributes, gdprEventAttributes));
           data.gtmOnSuccess();
         }
     }).catch((error) => {
@@ -1244,10 +1406,9 @@ if (!existingToken && hasHashedRecords) {
     });
 } else {
     log('Using existing token from 1p cookie:', existingToken);
-    tagIds.forEach((tag) => trackEvent(pixelUrls[region], existingToken, tag, eventName, finalAttributes, gdprAttributes));
+    tagIds.forEach((tag) => trackEvent(pixelUrls[region], existingToken, tag, eventName, finalAttributes, gdprEventAttributes));
   data.gtmOnSuccess();
 }
-
 
 ___SERVER_PERMISSIONS___
 
@@ -1447,7 +1608,6 @@ ___SERVER_PERMISSIONS___
   }
 ]
 
-
 ___TESTS___
 
 scenarios:
@@ -1538,9 +1698,9 @@ scenarios:
     }\n\nlet testResult = getTokenAndVerify(gtmOnSuccess, gtmOnFailure);\n\nassertThat(testResult,\
     \ \"Test Passed: Success callback was called.\");\n"
 - name: GTM sets the token inside the cookie once the token is retrieved
-  code: "let cookies = {}; // Simulate browser cookies storage\n\n// Mock setCookie\
+  code: "let cookies = {}; // Simulate browser cookies storage\nlet cookieOptions = {}; // Store cookie options\n\n// Mock setCookie\
     \ function\nfunction setCookie(name, value, options) {\n    // Store the cookie\
-    \ as a key-value pair, omitting logging.\n    cookies[name] = value;\n}\n\n//\
+    \ as a key-value pair, and store options\n    cookies[name] = value;\n    cookieOptions[name] = options;\n}\n\n//\
     \ Mock getCookieValues function\nfunction getCookieValues(cookieName) {\n    return\
     \ cookies[cookieName] ? [cookies[cookieName]] : [];\n}\n\nfunction testTokenStorage()\
     \ {\n    const expectedToken = \"mockToken123\"; \n\n    setCookie('aatToken',\
@@ -1588,6 +1748,672 @@ scenarios:
     \ = true; }\n};\n\nmock('getCookieValues', function(name) {\n  return [];\n});\n\
     \n// Call runCode to run the template's code.\nrunCode(localMockData);\n\n// Verify\
     \ that the tag finished successfully.\nassertApi('gtmOnSuccess').wasCalled();"
+- name: GTM aatToken cookie expiry is set to 7 days
+  code: "let capturedCookieOptions = null;\n\n// Mock setCookie to capture the options\nmock('setCookie', function(name, value, options) {\n  if (name === 'aatToken') {\n    capturedCookieOptions = options;\n  }\n});\n\n// The Setup block's sendHttpRequest mock returns a token and, unlike the mock that\n// used to live here, something the template's .catch can chain onto.\nnoExistingToken();\n\nconst testMockData = {\n  tagIds: [{TagIds: 'testTag'}],\n  standardEventName: 'PageView',\n  tagRegion: 'NA',\n  advancedMatchingList: [\n    {paramName: 'email', paramValue: 'test@example.com'}\n  ],\n  gtmOnSuccess: function() { successCalled = true; },\n  gtmOnFailure: function() { failureCalled = true; }\n};\n\n// Run the template code\nrunCode(testMockData);\n\n// Verify that the cookie was set with 7-day expiry\nconst expectedMaxAge = 3600 * 24 * 7; // 604800 seconds = 7 days\n\nassertThat(capturedCookieOptions, 'Cookie options should be captured');\nassertThat(capturedCookieOptions['max-age']).isEqualTo(expectedMaxAge);\nassertThat(capturedCookieOptions['max-age']).isEqualTo(604800);\nassertThat(capturedCookieOptions.path).isEqualTo('/');\nassertThat(capturedCookieOptions.httpOnly).isEqualTo(true);\nassertThat(capturedCookieOptions.secure).isEqualTo(true);\n\n// Verify that the template executed successfully\nassertApi('gtmOnSuccess').wasCalled();"
+- name: Amazon consent defaults to GRANTED on the token request, in either region
+  code: |-
+    // One scenario per region previously. The default is no longer region-dependent: it is a
+    // positive pair everywhere, so both regions assert the same thing.
+    function bareData(tagRegion) {
+      return {
+        tagIds: [{TagIds: tag1}],
+        standardEventName: eventName,
+        tagRegion: tagRegion,
+        page_location: 'https://example.com',
+        advancedMatchingList: [
+          {paramName: 'email', paramValue: 'test@example.com'}
+        ],
+        ttl: 3600,
+        amazonConsent: {enabled: true},
+        gtmOnSuccess: function() { successCalled = true; },
+        gtmOnFailure: function() { failureCalled = true; }
+      };
+    }
+
+    noExistingToken();
+
+    runCode(bareData('NA'));
+    assertThat(capturedBody).contains('"amzn_ad_storage":"GRANTED"');
+    assertThat(capturedBody).contains('"amzn_user_data":"GRANTED"');
+
+    runCode(bareData('EU'));
+    assertThat(capturedBody).contains('"amzn_ad_storage":"GRANTED"');
+    assertThat(capturedBody).contains('"amzn_user_data":"GRANTED"');
+    assertThat(capturedBody).doesNotContain('DENIED');
+- name: Configured DENIED consent is not overwritten in NA
+  code: |-
+    const localMockData = {
+      tagIds: [{TagIds: tag1}],
+      standardEventName: eventName,
+      tagRegion: 'NA',
+      page_location: 'https://example.com',
+      advancedMatchingList: [
+        {paramName: 'email', paramValue: 'test@example.com'}
+      ],
+      ttl: 3600,
+      amazonConsent: {enabled: true},
+      amznAdStorage: 'DENIED',
+      amznUserData: 'DENIED',
+      gtmOnSuccess: function() { successCalled = true; },
+      gtmOnFailure: function() { failureCalled = true; }
+    };
+
+    noExistingToken();
+
+    runCode(localMockData);
+
+    assertThat(capturedBody).contains('"amzn_ad_storage":"DENIED"');
+    assertThat(capturedBody).contains('"amzn_user_data":"DENIED"');
+- name: Configured GRANTED consent is not overwritten in EU
+  code: |-
+    const localMockData = {
+      tagIds: [{TagIds: tag1}],
+      standardEventName: eventName,
+      tagRegion: 'EU',
+      page_location: 'https://example.com',
+      advancedMatchingList: [
+        {paramName: 'email', paramValue: 'test@example.com'}
+      ],
+      ttl: 3600,
+      amazonConsent: {enabled: true},
+      amznAdStorage: 'GRANTED',
+      amznUserData: 'GRANTED',
+      gtmOnSuccess: function() { successCalled = true; },
+      gtmOnFailure: function() { failureCalled = true; }
+    };
+
+    noExistingToken();
+
+    runCode(localMockData);
+
+    assertThat(capturedBody).contains('"amzn_ad_storage":"GRANTED"');
+    assertThat(capturedBody).contains('"amzn_user_data":"GRANTED"');
+- name: Partially configured consent is not overwritten in EU
+  code: |-
+    const localMockData = {
+      tagIds: [{TagIds: tag1}],
+      standardEventName: eventName,
+      tagRegion: 'EU',
+      page_location: 'https://example.com',
+      advancedMatchingList: [
+        {paramName: 'email', paramValue: 'test@example.com'}
+      ],
+      ttl: 3600,
+      amazonConsent: {enabled: true},
+      amznUserData: 'GRANTED',
+      gtmOnSuccess: function() { successCalled = true; },
+      gtmOnFailure: function() { failureCalled = true; }
+    };
+
+    noExistingToken();
+
+    runCode(localMockData);
+
+    assertThat(capturedBody).contains('"amzn_user_data":"GRANTED"');
+    assertThat(capturedBody).doesNotContain('"amzn_ad_storage"');
+    assertThat(capturedBody).doesNotContain('DENIED');
+- name: TCF values reach the iu3 call as snake_case query parameters
+  code: |-
+    const localMockData = {
+      tagIds: [{TagIds: tag1}],
+      standardEventName: eventName,
+      tagRegion: region,
+      page_location: 'https://example.com',
+      advancedMatchingList: [],
+      ttl: 3600,
+      includeTcf: true,
+      gdpr: 1,
+      gdprPd: 1,
+      gdprConsent: exampleTCFv2ConsentString,
+      gtmOnSuccess: function() { successCalled = true; },
+      gtmOnFailure: function() { failureCalled = true; }
+    };
+
+    runCode(localMockData);
+
+    assertThat(capturedUrl).contains('&gdpr=1');
+    assertThat(capturedUrl).contains('&gdpr_pd=1');
+    assertThat(capturedUrl).contains('&gdpr_consent=' + exampleTCFv2ConsentString);
+    assertApi('sendHttpGet').wasCalled();
+- name: The envelope body still carries the TCF values when hashed records exist
+  code: |-
+    const localMockData = {
+      tagIds: [{TagIds: tag1}],
+      standardEventName: eventName,
+      tagRegion: region,
+      page_location: 'https://example.com',
+      advancedMatchingList: [
+        {paramName: 'email', paramValue: 'test@example.com'}
+      ],
+      ttl: 3600,
+      includeTcf: true,
+      gdpr: 1,
+      gdprPd: 1,
+      gdprConsent: exampleTCFv2ConsentString,
+      gtmOnSuccess: function() { successCalled = true; },
+      gtmOnFailure: function() { failureCalled = true; }
+    };
+
+    // No existing token, so the /envelope request is made first.
+    noExistingToken();
+
+    runCode(localMockData);
+
+    // Token path keeps camelCase and is unchanged by this fix.
+    assertThat(capturedBody).contains('"gdpr":1');
+    assertThat(capturedBody).contains('"gdprConsent":"' + exampleTCFv2ConsentString + '"');
+
+    // gdpr_pd stays off the token body, matching the client template.
+    assertThat(capturedBody).doesNotContain('gdprPd');
+    assertThat(capturedBody).doesNotContain('gdpr_pd');
+
+    // And the event call now carries all three.
+    assertThat(capturedUrl).contains('&gdpr_consent=' + exampleTCFv2ConsentString);
+- name: No TCF parameters are sent on the iu3 call when includeTcf is false
+  code: |-
+    const localMockData = {
+      tagIds: [{TagIds: tag1}],
+      standardEventName: eventName,
+      tagRegion: region,
+      page_location: 'https://example.com',
+      advancedMatchingList: [],
+      ttl: 3600,
+      includeTcf: false,
+      gdpr: 1,
+      gdprPd: 1,
+      gdprConsent: exampleTCFv2ConsentString,
+      gtmOnSuccess: function() { successCalled = true; },
+      gtmOnFailure: function() { failureCalled = true; }
+    };
+
+    runCode(localMockData);
+
+    assertThat(capturedUrl).doesNotContain('&gdpr=');
+    assertThat(capturedUrl).doesNotContain('&gdpr_pd=');
+    assertThat(capturedUrl).doesNotContain('&gdpr_consent=');
+    assertApi('sendHttpGet').wasCalled();
+- name: The TC string is sent on the iu3 call even when gdpr is omitted
+  code: |-
+    const localMockData = {
+      tagIds: [{TagIds: tag1}],
+      standardEventName: eventName,
+      tagRegion: region,
+      page_location: 'https://example.com',
+      advancedMatchingList: [],
+      ttl: 3600,
+      includeTcf: true,
+      gdprConsent: exampleTCFv2ConsentString,
+      gtmOnSuccess: function() { successCalled = true; },
+      gtmOnFailure: function() { failureCalled = true; }
+    };
+
+    runCode(localMockData);
+
+    // The three fields are independent of each other.
+    assertThat(capturedUrl).contains('&gdpr_consent=' + exampleTCFv2ConsentString);
+    assertThat(capturedUrl).doesNotContain('&gdpr=');
+    assertThat(capturedUrl).doesNotContain('&gdpr_pd=');
+- name: A configured TCF signal does not suppress the ACS default on the token request
+  code: |-
+    const localMockData = {
+      tagIds: [{TagIds: tag1}],
+      standardEventName: eventName,
+      tagRegion: 'EU',
+      page_location: 'https://example.com',
+      advancedMatchingList: [
+        {paramName: 'email', paramValue: 'test@example.com'}
+      ],
+      ttl: 3600,
+      amazonConsent: {enabled: true},
+      includeTcf: true,
+      gdpr: 1,
+      gdprConsent: exampleTCFv2ConsentString,
+      gtmOnSuccess: function() { successCalled = true; },
+      gtmOnFailure: function() { failureCalled = true; }
+    };
+
+    noExistingToken();
+
+    runCode(localMockData);
+
+    // TCF no longer suppresses the default: the token body carries both, as it did before
+    // the default was made region-aware. The advertiser configured no ACS pair, so the
+    // substituted one rides along.
+    assertThat(capturedBody).contains('"gdprConsent":"' + exampleTCFv2ConsentString + '"');
+    assertThat(capturedBody).contains('"amzn_ad_storage":"GRANTED"');
+    assertThat(capturedBody).contains('"amzn_user_data":"GRANTED"');
+- name: Advertiser ACS values pass through untouched when TCF is also configured
+  code: |-
+    const localMockData = {
+      tagIds: [{TagIds: tag1}],
+      standardEventName: eventName,
+      tagRegion: 'EU',
+      page_location: 'https://example.com',
+      advancedMatchingList: [
+        {paramName: 'email', paramValue: 'test@example.com'}
+      ],
+      ttl: 3600,
+      amazonConsent: {enabled: true},
+      includeTcf: true,
+      gdpr: 1,
+      gdprConsent: exampleTCFv2ConsentString,
+      amznAdStorage: 'GRANTED',
+      amznUserData: 'DENIED',
+      gtmOnSuccess: function() { successCalled = true; },
+      gtmOnFailure: function() { failureCalled = true; }
+    };
+
+    noExistingToken();
+
+    runCode(localMockData);
+
+    // The guard suppresses only the fabricated default, never real values.
+    assertThat(capturedBody).contains('"amzn_ad_storage":"GRANTED"');
+    assertThat(capturedBody).contains('"amzn_user_data":"DENIED"');
+    assertThat(capturedBody).contains('"gdprConsent":"' + exampleTCFv2ConsentString + '"');
+- name: Consent reaches the iu3 call when the advertiser has no hashed records
+  code: |-
+    // The Mercedes shape: consent configured, no customer data, so no /envelope call.
+    const encodeUriComponent = require('encodeUriComponent');
+
+    const localMockData = {
+      tagIds: [{TagIds: tag1}],
+      standardEventName: eventName,
+      tagRegion: 'EU',
+      page_location: 'https://example.com',
+      advancedMatchingList: [],
+      ttl: 3600,
+      amazonConsent: {enabled: true},
+      countryCode: 'ES',
+      amznAdStorage: 'GRANTED',
+      amznUserData: 'GRANTED',
+      gtmOnSuccess: function() { successCalled = true; },
+      gtmOnFailure: function() { failureCalled = true; }
+    };
+
+    runCode(localMockData);
+
+    assertThat(capturedUrl).contains('&amazonConsentString=');
+    assertThat(capturedUrl).contains(encodeUriComponent('"amzn_ad_storage":"GRANTED"'));
+    assertThat(capturedUrl).contains(encodeUriComponent('"amzn_user_data":"GRANTED"'));
+    assertThat(capturedUrl).contains(encodeUriComponent('"countryCode":"ES"'));
+    assertApi('sendHttpGet').wasCalled();
+- name: Consent reaches both the iu3 call and the envelope body when hashed records exist
+  code: |-
+    const encodeUriComponent = require('encodeUriComponent');
+
+    const localMockData = {
+      tagIds: [{TagIds: tag1}],
+      standardEventName: eventName,
+      tagRegion: 'NA',
+      page_location: 'https://example.com',
+      advancedMatchingList: [
+        {paramName: 'email', paramValue: 'test@example.com'}
+      ],
+      ttl: 3600,
+      amazonConsent: {enabled: true},
+      amznAdStorage: 'GRANTED',
+      amznUserData: 'DENIED',
+      gtmOnSuccess: function() { successCalled = true; },
+      gtmOnFailure: function() { failureCalled = true; }
+    };
+
+    noExistingToken();
+
+    runCode(localMockData);
+
+    // Regression guard: the envelope body still carries the consent string.
+    assertThat(capturedBody).contains('"amazonConsentString"');
+    assertThat(capturedBody).contains('"amzn_ad_storage":"GRANTED"');
+    assertThat(capturedBody).contains('"amzn_user_data":"DENIED"');
+
+    // And it now also rides the event call.
+    assertThat(capturedUrl).contains(encodeUriComponent('"amzn_ad_storage":"GRANTED"'));
+- name: The encoded consent parameter decodes back to the expected JSON shape
+  code: |-
+    const decodeUriComponent = require('decodeUriComponent');
+    const JSON = require('JSON');
+
+    const localMockData = {
+      tagIds: [{TagIds: tag1}],
+      standardEventName: eventName,
+      tagRegion: 'NA',
+      page_location: 'https://example.com',
+      advancedMatchingList: [],
+      ttl: 3600,
+      amazonConsent: {enabled: true},
+      countryCode: 'US',
+      ipAddress: '203.0.113.42',
+      amznAdStorage: 'GRANTED',
+      amznUserData: 'GRANTED',
+      gtmOnSuccess: function() { successCalled = true; },
+      gtmOnFailure: function() { failureCalled = true; }
+    };
+
+    runCode(localMockData);
+
+    const encodedValue = capturedUrl.split('amazonConsentString=')[1].split('&')[0];
+    const decoded = JSON.parse(decodeUriComponent(encodedValue));
+
+    assertThat(decoded.geo.countryCode).isEqualTo('US');
+    assertThat(decoded.geo.ipAddress).isEqualTo('203.0.113.42');
+    assertThat(decoded.consent.amazonConsentFormat.amzn_ad_storage).isEqualTo('GRANTED');
+    assertThat(decoded.consent.amazonConsentFormat.amzn_user_data).isEqualTo('GRANTED');
+- name: A long consent string does not abort the event
+  code: |-
+    // GPP carries an arbitrarily long string. Encoded, this consent object is well past
+    // constants.valueLength, which is why the parameter is appended after the gate.
+    let longGpp = '';
+    for (let i = 0; i < 4; i++) {
+      longGpp += exampleTCFv2ConsentString;
+    }
+
+    const localMockData = {
+      tagIds: [{TagIds: tag1}],
+      standardEventName: eventName,
+      tagRegion: 'EU',
+      page_location: 'https://example.com',
+      advancedMatchingList: [],
+      ttl: 3600,
+      amazonConsent: {enabled: true},
+      countryCode: 'DE',
+      amznAdStorage: 'DENIED',
+      amznUserData: 'DENIED',
+      gpp: longGpp,
+      gtmOnSuccess: function() { successCalled = true; },
+      gtmOnFailure: function() { failureCalled = true; }
+    };
+
+    runCode(localMockData);
+
+    const encodedValue = capturedUrl.split('amazonConsentString=')[1].split('&')[0];
+
+    // Past the 1000-character parameter-value limit enforced by the validation gate.
+    assertThat(encodedValue.length > 1000).isTrue();
+    assertApi('sendHttpGet').wasCalled();
+    assertApi('gtmOnSuccess').wasCalled();
+- name: A TCF-only advertiser gets TCF parameters and no consent string on the iu3 call
+  code: |-
+    const localMockData = {
+      tagIds: [{TagIds: tag1}],
+      standardEventName: eventName,
+      tagRegion: 'EU',
+      page_location: 'https://example.com',
+      advancedMatchingList: [],
+      ttl: 3600,
+      amazonConsent: {enabled: true},
+      includeTcf: true,
+      gdpr: 1,
+      gdprConsent: exampleTCFv2ConsentString,
+      gtmOnSuccess: function() { successCalled = true; },
+      gtmOnFailure: function() { failureCalled = true; }
+    };
+
+    runCode(localMockData);
+
+    // The substituted ACS pair is withheld from the event call, so the advertiser's TCF
+    // values are the only consent signal on it.
+    assertThat(capturedUrl).doesNotContain('amazonConsentString');
+    assertThat(capturedUrl).contains('&gdpr=1');
+    assertThat(capturedUrl).contains('&gdpr_consent=' + exampleTCFv2ConsentString);
+    assertApi('sendHttpGet').wasCalled();
+- name: A TC string with includeTcf off sends no consent parameter on the iu3 call
+  code: |-
+    // TCF is not being transmitted, so the advertiser has configured no consent.
+
+    const localMockData = {
+      tagIds: [{TagIds: tag1}],
+      standardEventName: eventName,
+      tagRegion: 'EU',
+      page_location: 'https://example.com',
+      advancedMatchingList: [],
+      ttl: 3600,
+      amazonConsent: {enabled: true},
+      includeTcf: false,
+      gdprConsent: exampleTCFv2ConsentString,
+      gtmOnSuccess: function() { successCalled = true; },
+      gtmOnFailure: function() { failureCalled = true; }
+    };
+
+    runCode(localMockData);
+
+    // The region default is substituted for the token request only.
+    assertThat(capturedUrl).doesNotContain('amazonConsentString');
+    assertApi('sendHttpGet').wasCalled();
+- name: Advertiser ACS values reach the iu3 call untouched when TCF is also configured
+  code: |-
+    const encodeUriComponent = require('encodeUriComponent');
+
+    const localMockData = {
+      tagIds: [{TagIds: tag1}],
+      standardEventName: eventName,
+      tagRegion: 'EU',
+      page_location: 'https://example.com',
+      advancedMatchingList: [],
+      ttl: 3600,
+      amazonConsent: {enabled: true},
+      includeTcf: true,
+      gdpr: 1,
+      gdprConsent: exampleTCFv2ConsentString,
+      amznAdStorage: 'GRANTED',
+      amznUserData: 'DENIED',
+      gtmOnSuccess: function() { successCalled = true; },
+      gtmOnFailure: function() { failureCalled = true; }
+    };
+
+    runCode(localMockData);
+
+    assertThat(capturedUrl).contains(encodeUriComponent('"amzn_ad_storage":"GRANTED"'));
+    assertThat(capturedUrl).contains(encodeUriComponent('"amzn_user_data":"DENIED"'));
+
+    // The TC string travels as its own parameter, not inside the consent object.
+    assertThat(capturedUrl).contains('&gdpr_consent=' + exampleTCFv2ConsentString);
+- name: No consent parameter is sent when neither geo nor consent has content
+  code: |-
+    // TCF configured, no ACS, no GPP and no geo: nothing left worth sending.
+    const localMockData = {
+      tagIds: [{TagIds: tag1}],
+      standardEventName: eventName,
+      tagRegion: 'EU',
+      page_location: 'https://example.com',
+      advancedMatchingList: [],
+      ttl: 3600,
+      amazonConsent: {enabled: true},
+      includeTcf: true,
+      gdpr: 1,
+      gdprConsent: exampleTCFv2ConsentString,
+      gtmOnSuccess: function() { successCalled = true; },
+      gtmOnFailure: function() { failureCalled = true; }
+    };
+
+    runCode(localMockData);
+
+    assertThat(capturedUrl).doesNotContain('amazonConsentString');
+    assertApi('sendHttpGet').wasCalled();
+- name: With nothing configured the default goes to the token request but not the event call
+  code: |-
+    const localMockData = {
+      tagIds: [{TagIds: tag1}],
+      standardEventName: eventName,
+      tagRegion: 'EU',
+      page_location: 'https://example.com',
+      advancedMatchingList: [
+        {paramName: 'email', paramValue: 'test@example.com'}
+      ],
+      ttl: 3600,
+      amazonConsent: {enabled: true},
+      gtmOnSuccess: function() { successCalled = true; },
+      gtmOnFailure: function() { failureCalled = true; }
+    };
+
+    noExistingToken();
+
+    runCode(localMockData);
+
+    // Token request keeps the substituted default.
+    assertThat(capturedBody).contains('"amzn_ad_storage":"GRANTED"');
+    assertThat(capturedBody).contains('"amzn_user_data":"GRANTED"');
+
+    // Event call sends nothing, as the client-side tag does.
+    assertThat(capturedUrl).doesNotContain('amazonConsentString');
+- name: A GPP string with no ACS values yields no amazonConsentFormat, in either region
+  code: |-
+    // One scenario per region previously; the assertions were identical, so both regions
+    // now run here. The region is the only variable, and neither may synthesise an ACS
+    // pair from a GPP string alone.
+    function gppData(tagRegion) {
+      return {
+        tagIds: [{TagIds: tag1}],
+        standardEventName: eventName,
+        tagRegion: tagRegion,
+        page_location: 'https://example.com',
+        advancedMatchingList: [
+          {paramName: 'email', paramValue: 'test@example.com'}
+        ],
+        ttl: 3600,
+        amazonConsent: {enabled: true},
+        gpp: 'DBABMA~1YNN',
+        gtmOnSuccess: function() { successCalled = true; },
+        gtmOnFailure: function() { failureCalled = true; }
+      };
+    }
+
+    noExistingToken();
+
+    runCode(gppData('NA'));
+    assertThat(capturedBody).contains('"gpp":"DBABMA~1YNN"');
+    assertThat(capturedBody).doesNotContain('amazonConsentFormat');
+
+    runCode(gppData('EU'));
+    assertThat(capturedBody).contains('"gpp":"DBABMA~1YNN"');
+    assertThat(capturedBody).doesNotContain('amazonConsentFormat');
+- name: No consent parameter reaches the iu3 call when nothing is configured, in either region
+  code: |-
+    // Matches the client-side tag, which sends nothing when nothing is configured. The
+    // region default is substituted for the token request only, in NA and in EU alike.
+    function bareData(tagRegion) {
+      return {
+        tagIds: [{TagIds: tag1}],
+        standardEventName: eventName,
+        tagRegion: tagRegion,
+        page_location: 'https://example.com',
+        advancedMatchingList: [],
+        ttl: 3600,
+        amazonConsent: {enabled: true},
+        gtmOnSuccess: function() { successCalled = true; },
+        gtmOnFailure: function() { failureCalled = true; }
+      };
+    }
+
+    runCode(bareData('EU'));
+    assertThat(capturedUrl).doesNotContain('amazonConsentString');
+
+    runCode(bareData('NA'));
+    assertThat(capturedUrl).doesNotContain('amazonConsentString');
+    assertApi('sendHttpGet').wasCalled();
+- name: The post-gate parameters on the iu3 call, client_ip and client_ua and arefs
+  code: |-
+    // Everything appended after the validation gate, in one test: all read from event
+    // data, all able to exceed what the gate allows.
+    const encodeUriComponent = require('encodeUriComponent');
+
+    let longUa = '';
+    for (let i = 0; i < 511; i++) {
+      longUa += 'a';
+    }
+    longUa += 'M';
+    for (let j = 0; j < 200; j++) {
+      longUa += 'Z';
+    }
+
+    let landingUrl = '';
+    let shopperIp = '203.0.113.42';
+    let shopperUa = 'Mozilla/5.0 Test';
+
+    // getEventData serves four keys; every case below states what it returns.
+    mock('getEventData', function(key) {
+      if (key === 'ip_override') return shopperIp;
+      if (key === 'user_agent') return shopperUa;
+      if (key === 'page_location') return landingUrl;
+      if (key === 'user_data') return undefined;
+      return undefined;
+    });
+
+    function eventData(tagRegion, withConsent) {
+      const base = {
+        tagIds: [{TagIds: tag1}],
+        standardEventName: eventName,
+        tagRegion: tagRegion,
+        advancedMatchingList: [],
+        ttl: 3600,
+        amazonConsent: {enabled: true},
+        gtmOnSuccess: function() { successCalled = true; },
+        gtmOnFailure: function() { failureCalled = true; }
+      };
+      if (withConsent) {
+        base.countryCode = 'ES';
+        base.amznAdStorage = 'GRANTED';
+        base.amznUserData = 'GRANTED';
+      }
+      return base;
+    }
+
+    // Both present, user agent percent-encoded.
+    runCode(eventData('NA', false));
+    assertThat(capturedUrl).contains('&client_ip=203.0.113.42');
+    assertThat(capturedUrl).contains('&client_ua=' + encodeUriComponent('Mozilla/5.0 Test'));
+    assertApi('sendHttpGet').wasCalled();
+
+    // AIP rejects brackets and a zone suffix, so both are stripped before encoding.
+    shopperIp = '[2001:db8::1]%eth0';
+    runCode(eventData('NA', false));
+    assertThat(capturedUrl).contains('&client_ip=2001%3Adb8%3A%3A1');
+    assertThat(capturedUrl).doesNotContain('%5B');
+    assertThat(capturedUrl).doesNotContain('eth0');
+
+    // The 512 limit is on the decoded value, so it is clamped at capture: the gate would
+    // abort the whole event.
+    shopperIp = '198.51.100.7';
+    shopperUa = longUa;
+    runCode(eventData('NA', false));
+    const expected = longUa.substring(0, 512);
+    assertThat(expected.length).isEqualTo(512);
+    assertThat(capturedUrl).contains('&client_ua=' + encodeUriComponent(expected));
+    assertThat(capturedUrl).doesNotContain('Z');
+
+    // Absent values emit nothing: never 'client_ip=undefined', never an empty 'client_ua='.
+    shopperIp = undefined;
+    shopperUa = undefined;
+    runCode(eventData('NA', false));
+    assertThat(capturedUrl).doesNotContain('client_ip');
+    assertThat(capturedUrl).doesNotContain('client_ua');
+
+    // Token read from page_location in the event data, serialised as <token>.<timestamp>.
+    // Persistence is deferred, so nothing on this path writes a cookie.
+    landingUrl = 'https://example.com/landing?utm_source=amazon&aref=tokenABC&gclid=xyz';
+    runCode(eventData('NA', false));
+    assertThat(capturedUrl).contains('&arefs=tokenABC.1625097600000');
+    assertThat(capturedUrl).contains('&arefsSource=url');
+    assertThat(capturedUrl).doesNotContain('utm_source');
+    assertThat(capturedUrl).doesNotContain('gclid');
+    assertThat(setCookieCalls.length).isEqualTo(0);
+
+    // No aref in the landing URL: no arefs parameter, and the event still fires.
+    landingUrl = 'https://example.com/landing?utm_source=amazon';
+    runCode(eventData('NA', false));
+    assertThat(capturedUrl).doesNotContain('arefs');
+    assertApi('sendHttpGet').wasCalled();
+
+    // All four on one call; nothing covered their interaction before.
+    shopperIp = '198.51.100.7';
+    shopperUa = 'Mozilla/5.0 Test';
+    landingUrl = 'https://example.com/?aref=testAref123';
+    runCode(eventData('EU', true));
+    assertThat(capturedUrl).contains('&amznToken=existingToken');
+    assertThat(capturedUrl).contains('&arefs=testAref123.1625097600000');
+    assertThat(capturedUrl).contains('&amazonConsentString=');
+    assertThat(capturedUrl).contains('&client_ip=198.51.100.7');
+    assertApi('gtmOnSuccess').wasCalled();
 setup: |-
   const log = require('logToConsole');
 
@@ -1616,9 +2442,14 @@ setup: |-
 
   var amznCalls = [];
   var setCookieCalls = [];
+  var capturedUrl = '';
+  var capturedBody = '';
   var successCalled = false;
   var failureCalled = false;
 
+  // Mirrors parseUrl: decoded values, a repeated key as an Array, fragment excluded.
+  // parseUrl returns searchParams as a plain object of key to string-or-Array, per
+  // https://developers.google.com/tag-platform/tag-manager/server-side/api#parseurl
   function simpleParseUrl(url) {
     var parts = url.split('?');
     var base = parts[0];
@@ -1632,9 +2463,7 @@ setup: |-
     }
     return {
       base: base,
-      searchParams: {
-        get: function(param) { return params[param]; }
-      }
+      searchParams: params
     };
   }
 
@@ -1667,6 +2496,7 @@ setup: |-
   });
 
   mock('sendHttpGet', function(url) {
+    capturedUrl = url;
     return {
       then: function(callback) {
         return callback({ statusCode: 200, body: 'Success' });
@@ -1675,23 +2505,26 @@ setup: |-
   });
 
   mock('sendHttpRequest', function(url, options, body) {
+    capturedBody = body;
     return {
       then: function(callback) {
-        return callback({
+        callback({
           statusCode: 200,
           body: '{"AIPToken": "newToken"}'
         });
+        // The template chains .catch onto the promise, so the mock must return
+        // something catchable or every test taking this path throws.
+        return {'catch': function(errCallback) {}};
       }
     };
   });
 
-  function resetMocks() {
-    amznCalls = [];
-    setCookieCalls = [];
-    successCalled = false;
-    failureCalled = false;
+  // No aatToken in the cookie, so the /envelope request is made.
+  function noExistingToken() {
+    mock('getCookieValues', function(name) {
+      return [];
+    });
   }
-
 
 ___NOTES___
 
