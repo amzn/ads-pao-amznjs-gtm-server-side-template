@@ -23,7 +23,7 @@ ___INFO___
     "ATTRIBUTION",
     "CONVERSIONS"
   ],
-  "description": "The server-side tag template to send event from your tagging server to Amazon Ad Tag. Version 1.5",
+  "description": "The server-side tag template to send event from your tagging server to Amazon Ad Tag. Version 1.6",
   "containerContexts": [
     "SERVER"
   ]
